@@ -1129,17 +1129,34 @@
               med([cs[0][2], cs[1][2], cs[2][2], cs[3][2]])];
     }
 
-    /* 1) 肤色遮罩 */
+    /* 1) 肤色遮罩：严格判定不通过时自动放宽，极端情况退化为中央区域 */
     var mask = new Uint8Array(w * h), hx = [], hy = [], x, y, i, c, o;
-    for(y = 0; y < h; y++){
-      for(x = 0; x < w; x++){
-        o = (y * w + x) << 2;
-        if(isSkinPx(px[o], px[o + 1], px[o + 2])){
-          mask[y * w + x] = 1; hx.push(x); hy.push(y);
+    function buildMask(fn){
+      mask = new Uint8Array(w * h); hx = []; hy = [];
+      for(var my = 0; my < h; my++){
+        for(var mx = 0; mx < w; mx++){
+          var mo = (my * w + mx) << 2;
+          if(fn(px[mo], px[mo + 1], px[mo + 2])){ mask[my * w + mx] = 1; hx.push(mx); hy.push(my); }
         }
       }
     }
-    if(hx.length < 60) return null;
+    function looseSkin(r, g, b){
+      var mx3 = Math.max(r, g, b), mn3 = Math.min(r, g, b);
+      if(r < 58 || mx3 > 252 || mx3 - mn3 > 132) return false;
+      if(r - g < 5 || r - b < 12) return false;
+      if(g - b < -12) return false;
+      return (r * 0.299 + g * 0.587 + b * 0.114) > 50;
+    }
+    buildMask(isSkinPx);
+    if(hx.length < 60) buildMask(looseSkin);
+    if(hx.length < 40){
+      mask = new Uint8Array(w * h); hx = []; hy = [];
+      var bx0 = Math.round(w * 0.26), bx1 = Math.round(w * 0.74);
+      var by0 = Math.round(h * 0.10), by1 = Math.round(h * 0.62);
+      for(y = by0; y <= by1; y++){
+        for(x = bx0; x <= bx1; x++){ mask[y * w + x] = 1; hx.push(x); hy.push(y); }
+      }
+    }
 
     // 脸部中轴
     var cxs = [];
@@ -1179,7 +1196,7 @@
 
     // 脸宽：颊部行的 80 分位（眼下方到嘴部，避开刘海、手、肩）
     var faceW = bandW(h * 0.30, h * 0.62);
-    if(faceW < w * 0.10) return null;
+    if(faceW < w * 0.10){ faceW = Math.round(w * 0.34); cx = Math.round(w / 2); }
 
     // 眼睛行：上下都被皮肤包住的深色像素最多处（排除遮住额头的刘海）
     function eyeDark(xx, yy){
@@ -1365,7 +1382,7 @@
     var dBrow = darkRatio(cx - fw * 0.32, cx + fw * 0.32, ey - fh * 0.20, ey - fh * 0.05, 105);
     var browSizeIdx = dBrow > 0.28 ? 2 : (dBrow > 0.15 ? 1 : 0);
 
-    var mCnt = 0, mTot = 0, mMinX = w, mMaxX = -1, mr = [], mg = [], mb = [];
+    var mCnt = 0, mTot = 0, mMinX = w, mMaxX = -1, mMinY = h, mMaxY = -1, mr = [], mg = [], mb = [];
     for(y = Math.round(chinY - fh * 0.32); y <= Math.round(chinY - fh * 0.12); y++){
       for(x = Math.round(cx - fw * 0.34); x <= Math.round(cx + fw * 0.34); x++){
         c = RGB(x, y); mTot++;
@@ -1373,6 +1390,8 @@
           mCnt++; mr.push(c[0]); mg.push(c[1]); mb.push(c[2]);
           if(x < mMinX) mMinX = x;
           if(x > mMaxX) mMaxX = x;
+          if(y < mMinY) mMinY = y;
+          if(y > mMaxY) mMaxY = y;
         }
       }
     }
@@ -1385,6 +1404,65 @@
 
     var dJaw = darkRatio(cx - fw * 0.40, cx + fw * 0.40, chinY - fh * 0.20, chinY, 120);
     var beardIdx = dJaw > 0.46 ? 4 : (dJaw > 0.34 ? 2 : 0);
+
+    /* 5c) 五官款式：按暗部区域的宽高比与竖向分布挑选具体形状 */
+    function darkBox(xa, xb, ya, yb, maxv){
+      var dx0 = -1, dx1 = -1, dy0 = -1, dy1 = -1, dn = 0, qx, qy, q;
+      for(qy = Math.round(ya); qy <= Math.round(yb); qy++){
+        for(qx = Math.round(xa); qx <= Math.round(xb); qx++){
+          q = RGB(qx, qy);
+          if(Math.max(q[0], q[1], q[2]) > maxv) continue;
+          if(isSkinPx(q[0], q[1], q[2])) continue;
+          dn++;
+          if(dx0 < 0 || qx < dx0) dx0 = qx;
+          if(qx > dx1) dx1 = qx;
+          if(dy0 < 0 || qy < dy0) dy0 = qy;
+          if(qy > dy1) dy1 = qy;
+        }
+      }
+      return dn ? { n:dn, w:dx1 - dx0 + 1, h:dy1 - dy0 + 1 } : null;
+    }
+
+    var eyeIdx = 2;
+    var eBox = darkBox(cx - fw * 0.34, cx + fw * 0.34, ey - fh * 0.03, ey + fh * 0.09, 118);
+    if(!eBox || dEye < 0.05) eyeIdx = 9;                       // 眯眯眼
+    else {
+      var eAsp = eBox.h / Math.max(1, eBox.w * 0.42);          // 单眼高 / 单眼宽
+      if(eAsp < 0.46) eyeIdx = 3;                             // 细长
+      else if(eAsp < 0.66) eyeIdx = 2;                        // 杏仁
+      else if(eAsp < 1.02) eyeIdx = 1;                        // 椭圆
+      else eyeIdx = 0;                                        // 圆眼
+    }
+
+    var browIdx = 0;
+    var bBox = darkBox(cx - fw * 0.32, cx + fw * 0.32, ey - fh * 0.22, ey - fh * 0.04, 112);
+    if(bBox){
+      var bTh = bBox.h / fh;
+      if(bTh > 0.085) browIdx = 2;                            // 粗眉
+      else if(bTh < 0.030) browIdx = 3;                       // 细眉
+      else if(bTh > 0.055) browIdx = 1;                       // 弯眉
+    }
+
+    var noseIdx = 0;
+    var nMax = Math.min(210, Math.round(skinRGB[0] * 0.84));
+    var nBox = darkBox(cx - fw * 0.24, cx + fw * 0.24, ey + fh * 0.20, ey + fh * 0.40, nMax);
+    if(nBox){
+      var nw = nBox.w / fw;
+      if(nw > 0.30) noseIdx = 6;                              // 宽鼻
+      else if(nw > 0.22) noseIdx = 1;                         // 大圆
+      else if(nw > 0.13) noseIdx = 0;                         // 小圆
+      else noseIdx = 3;                                       // 线条
+    }
+
+    var mouthIdx = 0;
+    if(mouthSizeIdx !== null){
+      var mH = mMaxY - mMinY + 1, mW = mMaxX - mMinX + 1;
+      var mAsp = mH / Math.max(1, mW);
+      if(mAsp > 0.62) mouthIdx = 7;                           // 张嘴笑
+      else if(mAsp > 0.40) mouthIdx = 1;                      // 大笑
+      else if(mW / fw < 0.14) mouthIdx = 9;                   // 小圆嘴
+      else if(mAsp < 0.14) mouthIdx = 11;                     // 一字嘴
+    }
 
     /* 6) 服装主色：画面下部靠中轴、明亮（受光）区域的中位色 */
     var oR = [], oG = [], oB = [], oTot = 0;
@@ -1420,6 +1498,10 @@
     if(outfitColorIdx !== null) patch.outfitColor = outfitColorIdx;
     patch.eyeSize = eyeSizeIdx;
     patch.browSize = browSizeIdx;
+    patch.eye = eyeIdx;
+    patch.brow = browIdx;
+    patch.nose = noseIdx;
+    patch.mouth = mouthIdx;
     if(mouthSizeIdx !== null){
       patch.mouthSize = mouthSizeIdx;
       patch.mouthColor = nearestIdx(MOUTH_COLOR, mouthRGB[0], mouthRGB[1], mouthRGB[2]);
